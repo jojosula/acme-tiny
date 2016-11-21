@@ -8,11 +8,121 @@ except ImportError:
 #DEFAULT_CA = "https://acme-staging.api.letsencrypt.org"
 DEFAULT_CA = "https://acme-v01.api.letsencrypt.org"
 
+CHALLENGE_TYPE_HTTP = 'http-01'
+CHALLENGE_TYPE_TLS_SNI = 'tls-sni-01'
+CHALLENGE_TYPE_TLS_SNI_V2 = 'tls-sni-02'
+CHALLENGE_TYPE_DNS = 'dns-01'
+
 LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.StreamHandler())
 LOGGER.setLevel(logging.INFO)
 
-def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
+def create_self_signed_cert_windows(san_a, san_b):
+    path = os.getcwd()
+    # windows style
+    origin_openssl_cnf = '{0}\\tests\\openssl.cnf'
+    self_csr_cnf = '{0}\\tmp\\csr.cnf'
+    self_csr = '{0}\\tmp\\self_csr'
+    self_key = '{0}\\tmp\\self_key'
+    self_cert = '{0}\\tmp\\self_cert'
+    cp_cmd = ('copy ' + origin_openssl_cnf + ' ' + self_csr_cnf + ' /y').format(path)
+    os.system(cp_cmd)
+
+    echo_cmd = ('echo [alt_names] >> ' + self_csr_cnf).format(path)
+    os.system(echo_cmd)
+    if san_b:
+        echo_cmd = ('echo DNS.1={1},DNS.2={2} >> ' + self_csr_cnf).format(path, san_a, san_b)
+    else:
+        echo_cmd = ('echo DNS.1={1} >> ' + self_csr_cnf).format(path, san_a)
+    os.system(echo_cmd)
+    csr_cmd = ('openssl req -new -newkey rsa:2048 -nodes -sha256 -keyout ' + self_key +
+        ' -out ' + self_csr + ' -subj "/CN=dummy" -config ' + self_csr_cnf).format(path)
+    print csr_cmd
+    os.system(csr_cmd)
+    cert_cmd = ('openssl x509 -req -days 7 -extensions v3_req -extfile ' + self_csr_cnf +
+        ' -in ' + self_csr + ' -signkey ' + self_key + ' -out ' + self_cert).format(path)
+    print cert_cmd
+    os.system(cert_cmd)
+
+
+def create_self_signed_cert_linux(san_a, san_b):
+    path = os.getcwd()
+    # linux style
+    origin_openssl_cnf = '{0}/tests/openssl.cnf'
+    self_csr_cnf = '{0}/tmp/csr.cnf'
+    self_csr = '{0}/tmp/self_csr'
+    self_key = '{0}/tmp/self_key'
+    self_cert = '{0}/tmp/self_cert'
+    cp_cmd = ('cp ' + origin_openssl_cnf + ' ' + self_csr_cnf).format(path)
+    result = os.system(cp_cmd)
+    if san_b:
+        echo_cmd = ('echo -e \"[alt_names]\nDNS.1={1},DNS.2={2}\" >> ' + self_csr_cnf).format(path, san_a, san_b)
+    else:
+        echo_cmd = ('echo -e \"[alt_names]\nDNS.1={1}\" >> ' + self_csr_cnf).format(path, san_a)
+    print echo_cmd
+    os.system(echo_cmd)
+    csr_cmd = ('openssl req -new -newkey rsa:2048 -nodes -sha256 -keyout ' + self_key +
+        ' -out ' + self_csr + ' -subj "/CN=dummy" -config ' + self_csr_cnf).format(path)
+    print csr_cmd
+    os.system(csr_cmd)
+    cert_cmd = ('openssl x509 -req -days 7 -extensions v3_req -extfile ' + self_csr_cnf +
+        ' -in ' + self_csr + ' -signkey ' + self_key + ' -out ' + self_cert).format(path)
+    print cert_cmd
+    os.system(cert_cmd)
+
+
+# replace the function by your os
+create_self_signed_cert = create_self_signed_cert_windows
+
+
+def prepare_tls_sni_challenge(tls_dict):
+    hex_token = hashlib.sha256(
+        tls_dict['token'].encode('utf8')).hexdigest().lower().encode()
+    hex_key = hashlib.sha256(
+        tls_dict['keyauthorization'].encode('utf8')).hexdigest().lower().encode()
+
+    # domain is too big to fit into CN, hence fit into subjectAltName
+    if tls_dict['challenge']['type'] == CHALLENGE_TYPE_TLS_SNI:
+        # tls-sni-01
+        san_a = b'{0}.{1}.acme.invalid'.format(hex_key[:32], hex_key[32:])
+        san_b = None
+    else:
+        # tls-sni-02
+        san_a = "{0}.{1}.token.acme.invalid".format(hex_token[:32], hex_token[32:])
+        san_b = b'{0}.{1}.ka.acme.invalid'.format(hex_key[:32], hex_key[32:])
+    create_self_signed_cert(san_a, san_b)
+
+
+def prepare_dns_challenge(domain_name, dns_dict):
+    # make the challenge file
+    host = domain_name.split('.')[0]
+    dns_txt_name = "{0}.{1}".format('_acme-challenge', host)
+    key_digest = hashlib.sha256(
+        dns_dict['keyauthorization'].encode('utf8')).digest()
+    content = base64.urlsafe_b64encode(key_digest).decode('utf8').replace("=", "")
+
+
+def parse_challenges(challenges, thumbprint):
+    http_dict = {}
+    http_dict['challenge'] = [c for c in challenges if c['type'] == CHALLENGE_TYPE_HTTP][0]
+    http_dict['token'] = re.sub(r"[^A-Za-z0-9_\-]", "_", http_dict['challenge']['token'])
+    http_dict['keyauthorization'] = "{0}.{1}".format(http_dict['token'], thumbprint)
+
+    tls_dict = {}
+    for cha in challenges:
+        if cha['type'] == CHALLENGE_TYPE_TLS_SNI or cha['type'] == CHALLENGE_TYPE_TLS_SNI_V2:
+            tls_dict['challenge'] = cha
+    tls_dict['token'] = re.sub(r"[^A-Za-z0-9_\-]", "_", tls_dict['challenge']['token'])
+    tls_dict['keyauthorization'] = "{0}.{1}".format(tls_dict['token'], thumbprint)
+
+    dns_dict = {}
+    dns_dict['challenge'] = [c for c in challenges if c['type'] == CHALLENGE_TYPE_DNS][0]
+    dns_dict['token'] = re.sub(r"[^A-Za-z0-9_\-]", "_", dns_dict['challenge']['token'])
+    dns_dict['keyauthorization'] = "{0}.{1}".format(dns_dict['token'], thumbprint)
+    return http_dict, tls_dict, dns_dict
+
+
+def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, challenge_type=CHALLENGE_TYPE_HTTP):
     # helper function base64 encode for jose spec
     def _b64(b):
         return base64.urlsafe_b64encode(b).decode('utf8').replace("=", "")
@@ -103,29 +213,43 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
         if code != 201:
             raise ValueError("Error requesting challenges: {0} {1}".format(code, result))
 
-        # make the challenge file
-        challenge = [c for c in json.loads(result.decode('utf8'))['challenges'] if c['type'] == "http-01"][0]
-        token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
-        keyauthorization = "{0}.{1}".format(token, thumbprint)
-        wellknown_path = os.path.join(acme_dir, token)
-        with open(wellknown_path, "w") as wellknown_file:
-            wellknown_file.write(keyauthorization)
+        # parse challenges
+        http_challenge_dict, tls_challenge_dict, dns_challenge_dict = parse_challenges(
+            json.loads(result.decode('utf8'))['challenges'], thumbprint)
 
-        # check that the file is in place
-        wellknown_url = "http://{0}/.well-known/acme-challenge/{1}".format(domain, token)
-        try:
-            resp = urlopen(wellknown_url)
-            resp_data = resp.read().decode('utf8').strip()
-            assert resp_data == keyauthorization
-        except (IOError, AssertionError):
-            os.remove(wellknown_path)
-            raise ValueError("Wrote file to {0}, but couldn't download {1}".format(
-                wellknown_path, wellknown_url))
+        wellknown_path = ''
+        # choose challenge for verify
+        if challenge_type == CHALLENGE_TYPE_TLS_SNI:
+            challenge_dict = tls_challenge_dict
+            # prepare tls-sni challenge
+            prepare_tls_sni_challenge(tls_challenge_dict)
+            # FIXME: need to apply certificate on your own
+        elif challenge_type == CHALLENGE_TYPE_DNS:
+            challenge_dict = dns_challenge_dict
+            # prepare DNS challenge
+            # FIXME: need to add TXT record on your own
+        else:
+            challenge_dict = http_challenge_dict
+            # prepare http challenge
+            wellknown_path = os.path.join(acme_dir, http_challenge_dict['token'])
+            with open(wellknown_path, "w") as wellknown_file:
+                wellknown_file.write(http_challenge_dict['keyauthorization'])
+
+            # check that the file is in place
+            wellknown_url = "http://{0}/.well-known/acme-challenge/{1}".format(domain, http_challenge_dict['token'])
+            try:
+                resp = urlopen(wellknown_url)
+                resp_data = resp.read().decode('utf8').strip()
+                assert resp_data == http_challenge_dict['keyauthorization']
+            except (IOError, AssertionError):
+                os.remove(wellknown_path)
+                raise ValueError("Wrote file to {0}, but couldn't download {1}".format(
+                    wellknown_path, wellknown_url))
 
         # notify challenge are met
-        code, result = _send_signed_request(challenge['uri'], {
+        code, result = _send_signed_request(challenge_dict['challenge']['uri'], {
             "resource": "challenge",
-            "keyAuthorization": keyauthorization,
+            "keyAuthorization": challenge_dict['keyauthorization'],
         })
         if code != 202:
             raise ValueError("Error triggering challenge: {0} {1}".format(code, result))
@@ -133,7 +257,7 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
         # wait for challenge to be verified
         while True:
             try:
-                resp = urlopen(challenge['uri'])
+                resp = urlopen(challenge_dict['challenge']['uri'])
                 challenge_status = json.loads(resp.read().decode('utf8'))
             except IOError as e:
                 raise ValueError("Error checking challenge: {0} {1}".format(
@@ -142,11 +266,14 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
                 time.sleep(2)
             elif challenge_status['status'] == "valid":
                 log.info("{0} verified!".format(domain))
-                os.remove(wellknown_path)
                 break
             else:
                 raise ValueError("{0} challenge did not pass: {1}".format(
                     domain, challenge_status))
+
+        # remove file
+        if wellknown_path:
+            os.remove(wellknown_path)
 
     # get the new certificate
     log.info("Signing certificate...")
@@ -188,10 +315,19 @@ def main(argv):
     parser.add_argument("--acme-dir", required=True, help="path to the .well-known/acme-challenge/ directory")
     parser.add_argument("--quiet", action="store_const", const=logging.ERROR, help="suppress output except for errors")
     parser.add_argument("--ca", default=DEFAULT_CA, help="certificate authority, default is Let's Encrypt")
+    parser.add_argument("--verify_type", default="http", help="challenge type for verify domain. default is http")
 
     args = parser.parse_args(argv)
     LOGGER.setLevel(args.quiet or LOGGER.level)
-    signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, CA=args.ca)
+
+    if args.verify_type == "https":
+        challenge_type = CHALLENGE_TYPE_TLS_SNI
+    elif args.verify_type == "dns":
+        challenge_type = CHALLENGE_TYPE_DNS
+    else:
+        challenge_type = CHALLENGE_TYPE_HTTP
+
+    signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, CA=args.ca, challenge_type=challenge_type)
     sys.stdout.write(signed_crt)
 
 if __name__ == "__main__": # pragma: no cover
