@@ -3,16 +3,14 @@
 import argparse, subprocess, json, os, sys, base64, binascii, time, hashlib, re, copy, textwrap, logging
 try:
     from urllib.request import urlopen, Request # Python 3
-    import ssl
-    context = ssl.create_default_context()
 except ImportError:
     from urllib2 import urlopen, Request # Python 2
-    import ssl
-    context = ssl._create_unverified_context()
+
+from cryptography import x509
 
 #DEFAULT_CA = "https://acme-staging-v02.api.letsencrypt.org"
-DEFAULT_CA = "https://acme-v02.api.letsencrypt.org" # DEPRECATED! USE DEFAULT_DIRECTORY_URL INSTEAD
 #DEFAULT_DIRECTORY_URL = "https://acme-staging-v02.api.letsencrypt.org/directory"
+DEFAULT_CA = "https://acme-v02.api.letsencrypt.org" # DEPRECATED! USE DEFAULT_DIRECTORY_URL INSTEAD
 DEFAULT_DIRECTORY_URL = "https://acme-v02.api.letsencrypt.org/directory"
 
 CHALLENGE_TYPE_HTTP = 'http-01'
@@ -45,11 +43,11 @@ def create_self_signed_cert_windows(san_a, san_b):
     os.system(echo_cmd)
     csr_cmd = ('openssl req -new -newkey rsa:2048 -nodes -sha256 -keyout ' + self_key +
         ' -out ' + self_csr + ' -subj "/CN=dummy" -config ' + self_csr_cnf).format(path)
-    print csr_cmd
+    print(csr_cmd)
     os.system(csr_cmd)
     cert_cmd = ('openssl x509 -req -days 7 -extensions v3_req -extfile ' + self_csr_cnf +
         ' -in ' + self_csr + ' -signkey ' + self_key + ' -out ' + self_cert).format(path)
-    print cert_cmd
+    print(cert_cmd)
     os.system(cert_cmd)
 
 
@@ -67,15 +65,15 @@ def create_self_signed_cert_linux(san_a, san_b):
         echo_cmd = ('echo -e \"[alt_names]\nDNS.1={1},DNS.2={2}\" >> ' + self_csr_cnf).format(path, san_a, san_b)
     else:
         echo_cmd = ('echo -e \"[alt_names]\nDNS.1={1}\" >> ' + self_csr_cnf).format(path, san_a)
-    print echo_cmd
+    print(echo_cmd)
     os.system(echo_cmd)
     csr_cmd = ('openssl req -new -newkey rsa:2048 -nodes -sha256 -keyout ' + self_key +
         ' -out ' + self_csr + ' -subj "/CN=dummy" -config ' + self_csr_cnf).format(path)
-    print csr_cmd
+    print(csr_cmd)
     os.system(csr_cmd)
     cert_cmd = ('openssl x509 -req -days 7 -extensions v3_req -extfile ' + self_csr_cnf +
         ' -in ' + self_csr + ' -signkey ' + self_key + ' -out ' + self_cert).format(path)
-    print cert_cmd
+    print(cert_cmd)
     os.system(cert_cmd)
 
 
@@ -83,14 +81,21 @@ def create_self_signed_cert_linux(san_a, san_b):
 create_self_signed_cert = create_self_signed_cert_windows
 
 
-def prepare_tls_sni_challenge(tls_dict):
+def prepare_tls_challenge(domain_name, tls_dict):
     hex_token = hashlib.sha256(
         tls_dict['token'].encode('utf8')).hexdigest().lower().encode()
     hex_key = hashlib.sha256(
         tls_dict['keyauthorization'].encode('utf8')).hexdigest().lower().encode()
 
     # domain is too big to fit into CN, hence fit into subjectAltName
-    if tls_dict['challenge']['type'] == CHALLENGE_TYPE_TLS_SNI:
+    if tls_dict['challenge']['type'] == CHALLENGE_TYPE_TLS_ALPN:
+        # tls-alpn-01
+        san_a = str.encode(domain_name)
+        san_b = None
+        custom_oid = x509.ObjectIdentifier('1.3.6.1.5.5.7.1.31')
+        extension = x509.Extension(oid=custom_oid, critical=True, value=hex_key)
+        # FIXME: not finished
+    elif tls_dict['challenge']['type'] == CHALLENGE_TYPE_TLS_SNI:
         # tls-sni-01
         san_a = b'{0}.{1}.acme.invalid'.format(hex_key[:32], hex_key[32:])
         san_b = None
@@ -117,9 +122,10 @@ def parse_challenges(challenges, thumbprint):
     http_dict['keyauthorization'] = "{0}.{1}".format(http_dict['token'], thumbprint)
     http_dict['url'] = http_dict['challenge']['url']
 
+    print(challenges)
     tls_dict = {}
     for cha in challenges:
-        if cha['type'] == CHALLENGE_TYPE_TLS_SNI or cha['type'] == CHALLENGE_TYPE_TLS_SNI_V2 or cha['type'] == CHALLENGE_TYPE_TLS_ALPN:
+        if cha['type'] == CHALLENGE_TYPE_TLS_ALPN:
             tls_dict['challenge'] = cha
     tls_dict['token'] = re.sub(r"[^A-Za-z0-9_\-]", "_", tls_dict['challenge']['token'])
     tls_dict['keyauthorization'] = "{0}.{1}".format(tls_dict['token'], thumbprint)
@@ -133,10 +139,11 @@ def parse_challenges(challenges, thumbprint):
     return http_dict, tls_dict, dns_dict
 
 
-def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check=False, directory_url=DEFAULT_DIRECTORY_URL, contact=None, challenge_type=CHALLENGE_TYPE_HTTP):
+
+def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, challenge_type=CHALLENGE_TYPE_HTTP, disable_check=False, directory_url=DEFAULT_DIRECTORY_URL, contact=None):
     directory, acct_headers, alg, jwk = None, None, None, None # global variables
 
-    # helper functions - base64 encode for jose spec
+    # helper function base64 encode for jose spec
     def _b64(b):
         return base64.urlsafe_b64encode(b).decode('utf8').replace("=", "")
 
@@ -147,11 +154,11 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
         if proc.returncode != 0:
             raise IOError("{0}\n{1}".format(err_msg, err))
         return out
-
+    
     # helper function - make request and automatically parse json response
     def _do_request(url, data=None, err_msg="Error", depth=0):
         try:
-            resp = urlopen(Request(url, data=data, headers={"Content-Type": "application/jose+json", "User-Agent": "acme-tiny"}), context=context)
+            resp = urlopen(Request(url, data=data, headers={"Content-Type": "application/jose+json", "User-Agent": "acme-tiny"}))
             resp_data, code, headers = resp.read().decode("utf8"), resp.getcode(), resp.headers
         except IOError as e:
             resp_data = e.read().decode("utf8") if hasattr(e, "read") else str(e)
@@ -168,7 +175,7 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
 
     # helper function - make signed requests
     def _send_signed_request(url, payload, err_msg, depth=0):
-        payload64 = _b64(json.dumps(payload).encode('utf8'))
+        payload64 = "" if payload is None else _b64(json.dumps(payload).encode('utf8'))
         new_nonce = _do_request(directory['newNonce'])[2]['Replay-Nonce']
         protected = {"url": url, "alg": alg, "nonce": new_nonce}
         protected.update({"jwk": jwk} if acct_headers is None else {"kid": acct_headers['Location']})
@@ -183,17 +190,17 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
 
     # helper function - poll until complete
     def _poll_until_not(url, pending_statuses, err_msg):
-        while True:
-            result, _, _ = _do_request(url, err_msg=err_msg)
-            if result['status'] in pending_statuses:
-                time.sleep(2)
-                continue
-            return result
-
+        result, t0 = None, time.time()
+        while result is None or result['status'] in pending_statuses:
+            assert (time.time() - t0 < 3600), "Polling timeout" # 1 hour timeout
+            time.sleep(0 if result is None else 2)
+            result, _, _ = _send_signed_request(url, None, err_msg)
+        return result
+    
     # parse account key to get public key
     log.info("Parsing account key...")
     out = _cmd(["openssl", "rsa", "-in", account_key, "-noout", "-text"], err_msg="OpenSSL Error")
-    pub_pattern = r"modulus:\n\s+00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)"
+    pub_pattern = r"modulus:\r?\n\s+00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)"
     pub_hex, pub_exp = re.search(pub_pattern, out.decode('utf8'), re.MULTILINE|re.DOTALL).groups()
     pub_exp = "{0:x}".format(int(pub_exp))
     pub_exp = "0{0}".format(pub_exp) if len(pub_exp) % 2 else pub_exp
@@ -213,7 +220,7 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
     common_name = re.search(r"Subject:.*? CN\s?=\s?([^\s,;/]+)", out.decode('utf8'))
     if common_name is not None:
         domains.add(common_name.group(1))
-    subject_alt_names = re.search(r"X509v3 Subject Alternative Name: \n +([^\n]+)\n", out.decode('utf8'), re.MULTILINE|re.DOTALL)
+    subject_alt_names = re.search(r"X509v3 Subject Alternative Name: (?:critical)?\n +([^\n]+)\n", out.decode('utf8'), re.MULTILINE|re.DOTALL)
     if subject_alt_names is not None:
         for san in subject_alt_names.group(1).split(", "):
             if san.startswith("DNS:"):
@@ -243,7 +250,7 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
 
     # get the authorizations that need to be completed
     for auth_url in order['authorizations']:
-        authorization, _, _ = _do_request(auth_url, err_msg="Error getting challenges")
+        authorization, _, _ = _send_signed_request(auth_url, None, "Error getting challenges")
         domain = authorization['identifier']['value']
         log.info("Verifying {0}...".format(domain))
 
@@ -253,10 +260,10 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
 
         wellknown_path = ''
         # choose challenge for verify
-        if challenge_type == CHALLENGE_TYPE_TLS_SNI:
+        if challenge_type == CHALLENGE_TYPE_TLS_ALPN:
             challenge_dict = tls_challenge_dict
-            # prepare tls-sni challenge
-            prepare_tls_sni_challenge(tls_challenge_dict)
+            # prepare tls challenge
+            prepare_tls_challenge(domain, tls_challenge_dict)
             # FIXME: need to apply certificate on your own
         elif challenge_type == CHALLENGE_TYPE_DNS:
             challenge_dict = dns_challenge_dict
@@ -300,10 +307,9 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA, disable_check
         raise ValueError("Order failed: {0}".format(order))
 
     # download the certificate
-    certificate_pem, _, _ = _do_request(order['certificate'], err_msg="Certificate download failed")
+    certificate_pem, _, _ = _send_signed_request(order['certificate'], None, "Certificate download failed")
     log.info("Certificate signed!")
-    return """-----BEGIN CERTIFICATE-----\n{0}\n-----END CERTIFICATE-----\n""".format(
-        "\n".join(textwrap.wrap(base64.b64encode(certificate_pem).decode('utf8'), 64)))
+    return certificate_pem
 
 def main(argv):
     parser = argparse.ArgumentParser(
@@ -313,13 +319,11 @@ def main(argv):
             the ACME protocol. It will need to be run on your server and have access to your private
             account key, so PLEASE READ THROUGH IT! It's only ~200 lines, so it won't take long.
 
-            ===Example Usage===
+            Example Usage:
             python acme_tiny.py --account-key ./account.key --csr ./domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > signed_chain.crt
-            ===================
 
-            ===Example Crontab Renewal (once per month)===
+            Example Crontab Renewal (once per month):
             0 0 1 * * python /path/to/acme_tiny.py --account-key /path/to/account.key --csr /path/to/domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > /path/to/signed_chain.crt 2>> /var/log/acme_tiny.log
-            ==============================================
             """)
     )
     parser.add_argument("--account-key", required=True, help="path to your Let's Encrypt account private key")
@@ -336,13 +340,13 @@ def main(argv):
     LOGGER.setLevel(args.quiet or LOGGER.level)
 
     if args.verify_type == "https":
-        challenge_type = CHALLENGE_TYPE_TLS_SNI
+        challenge_type = CHALLENGE_TYPE_TLS_ALPN
     elif args.verify_type == "dns":
         challenge_type = CHALLENGE_TYPE_DNS
     else:
         challenge_type = CHALLENGE_TYPE_HTTP
 
-    signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, CA=args.ca, disable_check=args.disable_check, directory_url=args.directory_url, contact=args.contact, challenge_type=challenge_type)
+    signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, CA=args.ca, challenge_type=challenge_type, disable_check=args.disable_check, directory_url=args.directory_url, contact=args.contact)
     sys.stdout.write(signed_crt)
 
 if __name__ == "__main__": # pragma: no cover
